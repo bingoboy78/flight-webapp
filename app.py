@@ -1,0 +1,536 @@
+import os
+import json
+import asyncio
+import uuid
+import urllib.request
+import sqlite3
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
+from sse_starlette.sse import EventSourceResponse
+from dotenv import load_dotenv
+from telegram import Bot
+
+from fli.models import (
+    Airport, FlightSearchFilters, FlightSegment, PassengerInfo,
+    MaxStops, LayoverRestrictions
+)
+from fli.search import SearchFlights
+
+load_dotenv()
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "flyhub2027")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DB_PATH = "flighthub.db"
+
+# In-memory task progress store
+tasks = {}
+
+# --- Database ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS searches (
+        id TEXT PRIMARY KEY,
+        created_at TEXT,
+        params TEXT,
+        results TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS monitors (
+        id TEXT PRIMARY KEY,
+        route TEXT,
+        created_at TEXT,
+        is_active INTEGER DEFAULT 1,
+        last_price REAL,
+        last_check TEXT
+    )""")
+    conn.commit()
+    conn.close()
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# --- Helpers ---
+def get_usd_rate():
+    try:
+        url = "https://open.er-api.com/v6/latest/ILS"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            return data["rates"]["USD"]
+    except Exception:
+        return 0.27
+
+def get_airport(code):
+    try:
+        return getattr(Airport, code.upper())
+    except AttributeError:
+        return None
+
+POPULAR_AIRPORTS = [
+    {"code": "TLV", "name": "Tel Aviv"},
+    {"code": "HKG", "name": "Hong Kong"},
+    {"code": "SIN", "name": "Singapore"},
+    {"code": "BKK", "name": "Bangkok"},
+    {"code": "NRT", "name": "Tokyo Narita"},
+    {"code": "ICN", "name": "Seoul"},
+    {"code": "KUL", "name": "Kuala Lumpur"},
+    {"code": "IST", "name": "Istanbul"},
+    {"code": "BCN", "name": "Barcelona"},
+    {"code": "CDG", "name": "Paris"},
+    {"code": "FCO", "name": "Rome"},
+    {"code": "LHR", "name": "London"},
+    {"code": "JFK", "name": "New York"},
+    {"code": "ATH", "name": "Athens"},
+    {"code": "AMS", "name": "Amsterdam"},
+    {"code": "DXB", "name": "Dubai"},
+    {"code": "MLE", "name": "Maldives"},
+    {"code": "CMB", "name": "Colombo"},
+    {"code": "DEL", "name": "Delhi"},
+    {"code": "MNL", "name": "Manila"},
+    {"code": "TPE", "name": "Taipei"},
+    {"code": "PEK", "name": "Beijing"},
+    {"code": "LAX", "name": "Los Angeles"},
+    {"code": "MIA", "name": "Miami"},
+    {"code": "PRG", "name": "Prague"},
+    {"code": "VIE", "name": "Vienna"},
+    {"code": "ZRH", "name": "Zurich"},
+]
+
+def is_regional(origin, dest):
+    asia = {"HKG", "SIN", "BKK", "NRT", "ICN", "KUL", "MNL", "TPE", "PEK", "CMB", "DEL"}
+    europe = {"BCN", "CDG", "FCO", "LHR", "ATH", "AMS", "PRG", "VIE", "ZRH", "IST"}
+    if origin in asia and dest in asia:
+        return True
+    if origin in europe and dest in europe:
+        return True
+    return False
+
+import re
+
+def sanitize_date(date_str):
+    """Ensure date is valid YYYY-MM-DD format."""
+    m = re.match(r'(\d+)-(\d{1,2})-(\d{1,2})', str(date_str))
+    if m:
+        year = int(m.group(1))
+        if year > 2100:  # Catch locale bugs like 12027 -> 2027
+            year = year % 10000
+        month = int(m.group(2))
+        day = int(m.group(3))
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return date_str
+
+def search_flight(origin_code, dest_code, date_str, direct_only=False):
+    date_str = sanitize_date(date_str)
+    search = SearchFlights()
+    regional = is_regional(origin_code, dest_code)
+
+    if direct_only or regional:
+        stops = MaxStops.NON_STOP
+        layover = None
+    else:
+        stops = MaxStops.ONE_STOP_OR_FEWER
+        layover = LayoverRestrictions(max_duration=420)
+
+    origin_ap = get_airport(origin_code)
+    dest_ap = get_airport(dest_code)
+    if not origin_ap or not dest_ap:
+        return None
+
+    filters = FlightSearchFilters(
+        passenger_info=PassengerInfo(adults=1),
+        stops=stops,
+        layover_restrictions=layover,
+        flight_segments=[
+            FlightSegment(
+                departure_airport=[[origin_ap, 0]],
+                arrival_airport=[[dest_ap, 0]],
+                travel_date=date_str
+            )
+        ]
+    )
+
+    try:
+        results = search.search(filters)
+        if results:
+            best = sorted(results, key=lambda f: f.price)[0]
+            legs_info = []
+            for leg in best.legs:
+                legs_info.append({
+                    "airline": str(leg.airline),
+                    "flight_number": str(leg.flight_number),
+                    "dep_airport": leg.departure_airport.name,
+                    "arr_airport": leg.arrival_airport.name,
+                    "dep_time": str(getattr(leg, 'departure_datetime', '')),
+                    "arr_time": str(getattr(leg, 'arrival_datetime', ''))
+                })
+            layover_info = None
+            if hasattr(best, 'layovers') and best.layovers:
+                l = best.layovers[0]
+                layover_info = {
+                    "airport": l.airport.name,
+                    "duration_min": l.duration
+                }
+            return {
+                "price_ils": best.price,
+                "duration_min": best.duration,
+                "stops": best.stops,
+                "legs": legs_info,
+                "layover": layover_info,
+                "regional": regional
+            }
+    except Exception:
+        pass
+    return None
+
+
+# --- App ---
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    with open("static/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/api/airports")
+async def airports():
+    return POPULAR_AIRPORTS
+
+
+@app.post("/api/search")
+async def start_search(request: Request):
+    body = await request.json()
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {"status": "pending", "progress": 0, "results": None, "total_steps": 0, "current_step": 0}
+
+    asyncio.create_task(run_search(task_id, body))
+    return {"task_id": task_id}
+
+
+async def run_search(task_id, params):
+    cities = params.get("cities", [])
+    mode = params.get("mode", "specific")
+    direct_only = params.get("direct_only", False)
+    usd_rate = get_usd_rate()
+
+    origin = "TLV"
+
+    if mode == "specific":
+        legs_input = params.get("legs", [])
+        total_steps = len(legs_input)
+        tasks[task_id]["total_steps"] = total_steps
+        tasks[task_id]["status"] = "running"
+
+        results_legs = []
+        total_ils = 0
+        international_ils = 0
+        internal_ils = 0
+
+        for i, leg in enumerate(legs_input):
+            tasks[task_id]["current_step"] = i + 1
+            tasks[task_id]["progress"] = int((i / total_steps) * 100)
+
+            result = await asyncio.to_thread(
+                search_flight, leg["from"], leg["to"], leg["date"], direct_only
+            )
+            if result:
+                total_ils += result["price_ils"]
+                if result["regional"]:
+                    internal_ils += result["price_ils"]
+                else:
+                    international_ils += result["price_ils"]
+                result["price_usd"] = round(result["price_ils"] * usd_rate, 0)
+                result["from"] = leg["from"]
+                result["to"] = leg["to"]
+                result["date"] = leg["date"]
+                results_legs.append(result)
+            else:
+                results_legs.append({"from": leg["from"], "to": leg["to"], "date": leg["date"], "error": "No flights found"})
+
+        combo = {
+            "total_ils": total_ils,
+            "total_usd": round(total_ils * usd_rate, 0),
+            "international_usd": round(international_ils * usd_rate, 0),
+            "internal_usd": round(internal_ils * usd_rate, 0),
+            "legs": results_legs
+        }
+        tasks[task_id]["results"] = [combo]
+        tasks[task_id]["progress"] = 100
+        tasks[task_id]["status"] = "done"
+
+        # Save to history
+        save_search(task_id, params, [combo])
+
+    elif mode == "flexible":
+        month = int(params.get("month", 1))
+        year = int(params.get("year", 2027))
+        min_days = int(params.get("min_trip", 12))
+        max_days = int(params.get("max_trip", 14))
+        min_stay = int(params.get("min_stay", 3))
+
+        route = [origin] + cities + [origin]
+        num_legs = len(route) - 1
+
+        # Build date ranges for each leg
+        import calendar
+        days_in_month = calendar.monthrange(year, month)[1]
+
+        # Fetch prices for all legs across the month
+        tasks[task_id]["status"] = "running"
+        tasks[task_id]["total_steps"] = num_legs
+        all_prices = {}
+
+        for leg_idx in range(num_legs):
+            o = route[leg_idx]
+            d = route[leg_idx + 1]
+            tasks[task_id]["current_step"] = leg_idx + 1
+            leg_key = f"{o}_{d}"
+            all_prices[leg_key] = {}
+
+            for day in range(1, days_in_month + 1):
+                date_str = f"{year}-{month:02d}-{day:02d}"
+                tasks[task_id]["progress"] = int(
+                    ((leg_idx * days_in_month + day) / (num_legs * days_in_month)) * 100
+                )
+                result = await asyncio.to_thread(search_flight, o, d, date_str, direct_only)
+                if result:
+                    all_prices[leg_key][date_str] = result
+
+        # Find best combinations
+        combos = []
+        for d1 in range(1, days_in_month + 1):
+            d1_str = f"{year}-{month:02d}-{d1:02d}"
+            key0 = f"{route[0]}_{route[1]}"
+            if d1_str not in all_prices.get(key0, {}):
+                continue
+
+            if num_legs == 3:
+                for d2 in range(d1 + min_stay, min(d1 + 9, days_in_month + 1)):
+                    d2_str = f"{year}-{month:02d}-{d2:02d}"
+                    key1 = f"{route[1]}_{route[2]}"
+                    if d2_str not in all_prices.get(key1, {}):
+                        continue
+                    for d3 in range(d2 + min_stay, min(d2 + 9, days_in_month + 1)):
+                        d3_str = f"{year}-{month:02d}-{d3:02d}"
+                        key2 = f"{route[2]}_{route[3]}"
+                        if d3_str not in all_prices.get(key2, {}):
+                            continue
+                        total_days = d3 - d1
+                        if min_days <= total_days <= max_days:
+                            f0 = all_prices[key0][d1_str]
+                            f1 = all_prices[key1][d2_str]
+                            f2 = all_prices[key2][d3_str]
+                            total = f0["price_ils"] + f1["price_ils"] + f2["price_ils"]
+                            intl = sum(f["price_ils"] for f in [f0, f1, f2] if not f["regional"])
+                            intrnl = sum(f["price_ils"] for f in [f0, f1, f2] if f["regional"])
+                            legs_out = []
+                            for f, dt, o2, d2x in [(f0, d1_str, route[0], route[1]),
+                                                    (f1, d2_str, route[1], route[2]),
+                                                    (f2, d3_str, route[2], route[3])]:
+                                fc = dict(f)
+                                fc["price_usd"] = round(fc["price_ils"] * usd_rate, 0)
+                                fc["from"] = o2
+                                fc["to"] = d2x
+                                fc["date"] = dt
+                                legs_out.append(fc)
+                            combos.append({
+                                "total_ils": total,
+                                "total_usd": round(total * usd_rate, 0),
+                                "international_usd": round(intl * usd_rate, 0),
+                                "internal_usd": round(intrnl * usd_rate, 0),
+                                "days": total_days,
+                                "legs": legs_out
+                            })
+
+            elif num_legs == 2:
+                for d2 in range(d1 + min_stay, min(d1 + max_days + 1, days_in_month + 1)):
+                    d2_str = f"{year}-{month:02d}-{d2:02d}"
+                    key1 = f"{route[1]}_{route[2]}"
+                    if d2_str not in all_prices.get(key1, {}):
+                        continue
+                    total_days = d2 - d1
+                    if min_days <= total_days <= max_days:
+                        f0 = all_prices[key0][d1_str]
+                        f1 = all_prices[key1][d2_str]
+                        total = f0["price_ils"] + f1["price_ils"]
+                        legs_out = []
+                        for f, dt, o2, d2x in [(f0, d1_str, route[0], route[1]),
+                                                (f1, d2_str, route[1], route[2])]:
+                            fc = dict(f)
+                            fc["price_usd"] = round(fc["price_ils"] * usd_rate, 0)
+                            fc["from"] = o2
+                            fc["to"] = d2x
+                            fc["date"] = dt
+                            legs_out.append(fc)
+                        combos.append({
+                            "total_ils": total,
+                            "total_usd": round(total * usd_rate, 0),
+                            "international_usd": round(total * usd_rate, 0),
+                            "internal_usd": 0,
+                            "days": total_days,
+                            "legs": legs_out
+                        })
+
+        combos.sort(key=lambda x: x["total_usd"])
+        top5 = combos[:5]
+        tasks[task_id]["results"] = top5
+        tasks[task_id]["progress"] = 100
+        tasks[task_id]["status"] = "done"
+        save_search(task_id, params, top5)
+
+
+def save_search(task_id, params, results):
+    conn = db_conn()
+    conn.execute(
+        "INSERT INTO searches (id, created_at, params, results) VALUES (?, ?, ?, ?)",
+        (task_id, datetime.now().isoformat(), json.dumps(params), json.dumps(results))
+    )
+    conn.commit()
+    conn.close()
+
+
+@app.get("/api/search/stream/{task_id}")
+async def stream_progress(task_id: str):
+    async def event_generator():
+        while True:
+            if task_id not in tasks:
+                yield {"data": json.dumps({"error": "Task not found"})}
+                break
+            t = tasks[task_id]
+            yield {"data": json.dumps({
+                "status": t["status"],
+                "progress": t["progress"],
+                "current_step": t.get("current_step", 0),
+                "total_steps": t.get("total_steps", 0),
+                "results": t.get("results")
+            })}
+            if t["status"] in ("done", "error"):
+                break
+            await asyncio.sleep(1)
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/api/history")
+async def get_history():
+    conn = db_conn()
+    rows = conn.execute("SELECT id, created_at, params, results FROM searches ORDER BY created_at DESC LIMIT 50").fetchall()
+    conn.close()
+    return [{"id": r["id"], "created_at": r["created_at"],
+             "params": json.loads(r["params"]), "results": json.loads(r["results"])} for r in rows]
+
+
+@app.post("/api/monitor")
+async def create_monitor(request: Request):
+    body = await request.json()
+    monitor_id = str(uuid.uuid4())
+    conn = db_conn()
+    conn.execute(
+        "INSERT INTO monitors (id, route, created_at) VALUES (?, ?, ?)",
+        (monitor_id, json.dumps(body), datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    # Send confirmation to Telegram
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            bot = Bot(TELEGRAM_BOT_TOKEN)
+            legs = body.get("legs", [])
+            route_str = " > ".join([l.get("from", "?") for l in legs] + [legs[-1].get("to", "?")])
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"New flight monitor set!\nRoute: {route_str}\nDates: {legs[0].get('date','')} - {legs[-1].get('date','')}"
+            )
+        except Exception:
+            pass
+
+    return {"id": monitor_id, "status": "created"}
+
+
+@app.get("/api/monitors")
+async def get_monitors():
+    conn = db_conn()
+    rows = conn.execute("SELECT * FROM monitors WHERE is_active = 1 ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [{"id": r["id"], "route": json.loads(r["route"]),
+             "created_at": r["created_at"], "last_price": r["last_price"],
+             "last_check": r["last_check"]} for r in rows]
+
+
+@app.delete("/api/monitor/{monitor_id}")
+async def delete_monitor(monitor_id: str):
+    conn = db_conn()
+    conn.execute("UPDATE monitors SET is_active = 0 WHERE id = ?", (monitor_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+
+@app.post("/api/heatmap")
+async def start_heatmap(request: Request):
+    body = await request.json()
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {"status": "pending", "progress": 0, "results": None}
+    asyncio.create_task(run_heatmap(task_id, body))
+    return {"task_id": task_id}
+
+
+async def run_heatmap(task_id, params):
+    import calendar
+    origin = params.get("origin", "TLV")
+    dest = params.get("destination", "HKG")
+    month = int(params.get("month", 1))
+    year = int(params.get("year", 2027))
+    direct_only = params.get("direct_only", False)
+
+    days_in_month = calendar.monthrange(year, month)[1]
+    usd_rate = get_usd_rate()
+    tasks[task_id]["status"] = "running"
+    tasks[task_id]["total_steps"] = days_in_month
+
+    prices = {}
+    for day in range(1, days_in_month + 1):
+        tasks[task_id]["current_step"] = day
+        tasks[task_id]["progress"] = int((day / days_in_month) * 100)
+        date_str = f"{year}-{month:02d}-{day:02d}"
+
+        result = await asyncio.to_thread(search_flight, origin, dest, date_str, direct_only)
+        if result:
+            prices[date_str] = {
+                "price_ils": result["price_ils"],
+                "price_usd": round(result["price_ils"] * usd_rate, 0),
+                "stops": result["stops"]
+            }
+
+    tasks[task_id]["results"] = {
+        "origin": origin,
+        "destination": dest,
+        "month": month,
+        "year": year,
+        "prices": prices
+    }
+    tasks[task_id]["progress"] = 100
+    tasks[task_id]["status"] = "done"
+
+
+@app.post("/api/auth")
+async def auth(request: Request):
+    body = await request.json()
+    if body.get("password") == APP_PASSWORD:
+        return {"status": "ok"}
+    raise HTTPException(status_code=401, detail="Wrong password")
