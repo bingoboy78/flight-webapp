@@ -66,6 +66,32 @@ def get_usd_rate():
     except Exception:
         return 0.27
 
+def to_usd(amount, currency):
+    if not amount:
+        return 0.0
+    c = str(currency or "USD").upper()
+    if c == "USD":
+        return float(amount)
+    if c == "ILS":
+        return float(amount) * get_usd_rate()
+    if c == "EUR":
+        return float(amount) * 1.08
+    if c == "GBP":
+        return float(amount) * 1.28
+    return float(amount)
+
+def to_ils(amount, currency):
+    usd_val = to_usd(amount, currency)
+    rate = get_usd_rate()
+    if rate > 0:
+        return round(usd_val / rate, 0)
+    return round(usd_val * 3.7, 0)
+
+def make_google_flights_url(origin, dest, date, return_date=None):
+    if return_date:
+        return f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{date}%20through%20{return_date}"
+    return f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{date}"
+
 def get_airport(code):
     try:
         return getattr(Airport, code.upper())
@@ -176,13 +202,28 @@ def search_flight(origin_code, dest_code, date_str, direct_only=False):
                     "airport": l.airport.name,
                     "duration_min": l.duration
                 }
+            currency = getattr(best, "currency", "USD") or "USD"
+            raw_price = float(best.price)
+            price_usd = round(to_usd(raw_price, currency), 0)
+            price_ils = to_ils(raw_price, currency)
+
+            raw_dur = getattr(best, 'duration', 0)
+            if isinstance(raw_dur, timedelta):
+                dur_min = int(raw_dur.total_seconds() // 60)
+            else:
+                dur_min = int(raw_dur or 0)
+
             return {
-                "price_ils": best.price,
-                "duration_min": best.duration,
+                "raw_price": raw_price,
+                "currency": currency,
+                "price_ils": price_ils,
+                "price_usd": price_usd,
+                "duration_min": dur_min,
                 "stops": best.stops,
                 "legs": legs_info,
                 "layover": layover_info,
-                "regional": regional
+                "regional": regional,
+                "booking_url": make_google_flights_url(origin_code, dest_code, date_str)
             }
     except Exception:
         pass
@@ -237,9 +278,10 @@ async def run_search(task_id, params):
         tasks[task_id]["status"] = "running"
 
         results_legs = []
+        total_usd = 0
         total_ils = 0
-        international_ils = 0
-        internal_ils = 0
+        international_usd = 0
+        internal_usd = 0
 
         for i, leg in enumerate(legs_input):
             tasks[task_id]["current_step"] = i + 1
@@ -249,24 +291,37 @@ async def run_search(task_id, params):
                 search_flight, leg["from"], leg["to"], leg["date"], direct_only
             )
             if result:
+                total_usd += result["price_usd"]
                 total_ils += result["price_ils"]
                 if result["regional"]:
-                    internal_ils += result["price_ils"]
+                    internal_usd += result["price_usd"]
                 else:
-                    international_ils += result["price_ils"]
-                result["price_usd"] = round(result["price_ils"] * usd_rate, 0)
+                    international_usd += result["price_usd"]
                 result["from"] = leg["from"]
                 result["to"] = leg["to"]
                 result["date"] = leg["date"]
                 results_legs.append(result)
             else:
-                results_legs.append({"from": leg["from"], "to": leg["to"], "date": leg["date"], "error": "No flights found"})
+                results_legs.append({
+                    "from": leg["from"],
+                    "to": leg["to"],
+                    "date": leg["date"],
+                    "booking_url": make_google_flights_url(leg["from"], leg["to"], leg["date"]),
+                    "error": "No flights found"
+                })
+
+        booking_url = None
+        if len(results_legs) == 2 and results_legs[0].get("from") == results_legs[1].get("to") and results_legs[0].get("to") == results_legs[1].get("from"):
+            booking_url = make_google_flights_url(results_legs[0]["from"], results_legs[0]["to"], results_legs[0]["date"], results_legs[1]["date"])
+        elif results_legs:
+            booking_url = results_legs[0].get("booking_url")
 
         combo = {
             "total_ils": total_ils,
-            "total_usd": round(total_ils * usd_rate, 0),
-            "international_usd": round(international_ils * usd_rate, 0),
-            "internal_usd": round(internal_ils * usd_rate, 0),
+            "total_usd": total_usd,
+            "international_usd": international_usd,
+            "internal_usd": internal_usd,
+            "booking_url": booking_url,
             "legs": results_legs
         }
         tasks[task_id]["results"] = [combo]
@@ -335,24 +390,25 @@ async def run_search(task_id, params):
                             f0 = all_prices[key0][d1_str]
                             f1 = all_prices[key1][d2_str]
                             f2 = all_prices[key2][d3_str]
-                            total = f0["price_ils"] + f1["price_ils"] + f2["price_ils"]
-                            intl = sum(f["price_ils"] for f in [f0, f1, f2] if not f["regional"])
-                            intrnl = sum(f["price_ils"] for f in [f0, f1, f2] if f["regional"])
+                            total_usd = f0["price_usd"] + f1["price_usd"] + f2["price_usd"]
+                            total_ils = f0["price_ils"] + f1["price_ils"] + f2["price_ils"]
+                            intl_usd = sum(f["price_usd"] for f in [f0, f1, f2] if not f["regional"])
+                            intrnl_usd = sum(f["price_usd"] for f in [f0, f1, f2] if f["regional"])
                             legs_out = []
                             for f, dt, o2, d2x in [(f0, d1_str, route[0], route[1]),
                                                     (f1, d2_str, route[1], route[2]),
                                                     (f2, d3_str, route[2], route[3])]:
                                 fc = dict(f)
-                                fc["price_usd"] = round(fc["price_ils"] * usd_rate, 0)
                                 fc["from"] = o2
                                 fc["to"] = d2x
                                 fc["date"] = dt
                                 legs_out.append(fc)
                             combos.append({
-                                "total_ils": total,
-                                "total_usd": round(total * usd_rate, 0),
-                                "international_usd": round(intl * usd_rate, 0),
-                                "internal_usd": round(intrnl * usd_rate, 0),
+                                "total_ils": total_ils,
+                                "total_usd": total_usd,
+                                "international_usd": intl_usd,
+                                "internal_usd": intrnl_usd,
+                                "booking_url": f0.get("booking_url"),
                                 "days": total_days,
                                 "legs": legs_out
                             })
@@ -367,21 +423,22 @@ async def run_search(task_id, params):
                     if min_days <= total_days <= max_days:
                         f0 = all_prices[key0][d1_str]
                         f1 = all_prices[key1][d2_str]
-                        total = f0["price_ils"] + f1["price_ils"]
+                        total_usd = f0["price_usd"] + f1["price_usd"]
+                        total_ils = f0["price_ils"] + f1["price_ils"]
                         legs_out = []
                         for f, dt, o2, d2x in [(f0, d1_str, route[0], route[1]),
                                                 (f1, d2_str, route[1], route[2])]:
                             fc = dict(f)
-                            fc["price_usd"] = round(fc["price_ils"] * usd_rate, 0)
                             fc["from"] = o2
                             fc["to"] = d2x
                             fc["date"] = dt
                             legs_out.append(fc)
                         combos.append({
-                            "total_ils": total,
-                            "total_usd": round(total * usd_rate, 0),
-                            "international_usd": round(total * usd_rate, 0),
+                            "total_ils": total_ils,
+                            "total_usd": total_usd,
+                            "international_usd": total_usd,
                             "internal_usd": 0,
+                            "booking_url": make_google_flights_url(route[0], route[1], d1_str, d2_str),
                             "days": total_days,
                             "legs": legs_out
                         })
@@ -513,8 +570,9 @@ async def run_heatmap(task_id, params):
         if result:
             prices[date_str] = {
                 "price_ils": result["price_ils"],
-                "price_usd": round(result["price_ils"] * usd_rate, 0),
-                "stops": result["stops"]
+                "price_usd": result["price_usd"],
+                "stops": result["stops"],
+                "booking_url": result.get("booking_url")
             }
 
     tasks[task_id]["results"] = {

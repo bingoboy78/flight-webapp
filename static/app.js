@@ -278,10 +278,14 @@ function renderResults(results) {
                 const stops = leg.stops === 0 ? 'Direct' : `${leg.stops} stop`;
                 const airline = (leg.legs && leg.legs[0]) ? leg.legs[0].airline.replace('Airline.','') : '';
                 const dur = `${Math.floor((leg.duration_min||0)/60)}h${(leg.duration_min||0)%60}m`;
+                const legUrl = leg.booking_url || `https://www.google.com/travel/flights?q=Flights%20from%20${leg.from}%20to%20${leg.to}%20on%20${leg.date}`;
                 legsHtml += `
                     <div class="leg-info">
                         <div>
-                            <div class="leg-route">${leg.from} → ${leg.to} <span class="leg-date-tag">${leg.date}</span></div>
+                            <div class="leg-route">
+                                ${leg.from} → ${leg.to} <span class="leg-date-tag">${leg.date}</span>
+                                <a href="${legUrl}" target="_blank" rel="noopener noreferrer" class="leg-link" title="Open in Google Flights">Google Flights ↗</a>
+                            </div>
                             <div class="leg-details">${airline} · ${stops} · ${dur}</div>
                         </div>
                         <span class="leg-price">$${(leg.price_usd||0).toLocaleString()}</span>
@@ -289,6 +293,7 @@ function renderResults(results) {
             }
         });
 
+        const mainUrl = combo.booking_url || (combo.legs && combo.legs[0] ? combo.legs[0].booking_url : 'https://www.google.com/travel/flights');
         card.innerHTML = `
             <div class="result-top">
                 <span class="result-rank">${idx + 1}</span>
@@ -300,6 +305,10 @@ function renderResults(results) {
             </div>
             <div class="result-legs">${legsHtml}</div>
             <div class="result-actions">
+                <a href="${mainUrl}" target="_blank" rel="noopener noreferrer" class="btn-source">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+                    Google Flights
+                </a>
                 <button class="btn-alert" onclick='setMonitor(${JSON.stringify(combo.legs).replace(/'/g, "&#39;")})'>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 01-3.46 0"/></svg>
                     Track price
