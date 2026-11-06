@@ -60,10 +60,47 @@ async function loadAirports() {
     try {
         const res = await fetch('/api/airports');
         airports = await res.json();
+        updateDatalist();
         populateHeatmapSelects();
     } catch (e) {
         console.error('Failed to load airports', e);
     }
+}
+
+function updateDatalist() {
+    const dl = document.getElementById('airports-datalist');
+    if (!dl) return;
+    dl.innerHTML = '';
+    airports.forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = `${a.code} — ${a.name}`;
+        dl.appendChild(opt);
+    });
+}
+
+function normalizeAirportCode(val) {
+    if (!val) return '';
+    val = val.trim();
+    // 1. Matches "LHR — London Heathrow" or "LHR"
+    const m = val.match(/^([A-Za-z]{3})(?:\s*[-—].*)?$/);
+    if (m) return m[1].toUpperCase();
+
+    // 2. Search by city/airport name in airports list
+    const lower = val.toLowerCase();
+    const found = airports.find(a => a.name.toLowerCase().includes(lower) || a.code.toLowerCase() === lower);
+    if (found) return found.code;
+
+    // 3. Fallback: Any 3 consecutive letters
+    const any3 = val.match(/\b([A-Za-z]{3})\b/);
+    if (any3) return any3[1].toUpperCase();
+
+    return val.trim().slice(0, 3).toUpperCase();
+}
+
+function getAirportDisplayName(code) {
+    if (!code) return '';
+    const a = airports.find(x => x.code.toUpperCase() === code.toUpperCase());
+    return a ? `${a.code} — ${a.name}` : code.toUpperCase();
 }
 
 function makeAirportSelect(selectedCode) {
@@ -96,8 +133,8 @@ function populateHeatmapSelects() {
 
 // ──── Cities ────
 function addCity() {
-    const defaultCodes = ['HKG', 'SIN', 'BKK', 'NRT', 'ICN'];
-    const code = defaultCodes[cities.length] || airports[1]?.code || 'HKG';
+    const defaultCodes = ['LHR', 'CDG', 'FCO', 'BCN', 'BER'];
+    const code = defaultCodes[cities.length] || 'LHR';
     cities.push(code);
     renderCities();
     updateLegs();
@@ -120,10 +157,41 @@ function renderCities() {
         num.className = 'city-num';
         num.textContent = i + 1;
 
-        const sel = makeAirportSelect(code);
-        sel.addEventListener('change', () => {
-            cities[i] = sel.value;
-            updateLegs();
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'city-input';
+        input.setAttribute('list', 'airports-datalist');
+        input.placeholder = 'Search city or airport (e.g. LHR, BER, Rome)';
+        input.value = getAirportDisplayName(code);
+
+        // Select all text when clicking into the input for easy editing
+        input.addEventListener('focus', () => input.select());
+
+        const handleUpdate = () => {
+            const raw = input.value;
+            const norm = normalizeAirportCode(raw);
+            if (norm) {
+                cities[i] = norm;
+                updateLegs();
+            }
+        };
+
+        input.addEventListener('input', () => {
+            const norm = normalizeAirportCode(input.value);
+            if (norm && norm.length === 3) {
+                cities[i] = norm;
+                updateLegs();
+            }
+        });
+
+        input.addEventListener('change', () => {
+            handleUpdate();
+            input.value = getAirportDisplayName(cities[i]);
+        });
+
+        input.addEventListener('blur', () => {
+            handleUpdate();
+            input.value = getAirportDisplayName(cities[i]);
         });
 
         const removeBtn = document.createElement('button');
@@ -132,7 +200,7 @@ function renderCities() {
         removeBtn.onclick = () => removeCity(i);
 
         row.appendChild(num);
-        row.appendChild(sel);
+        row.appendChild(input);
         if (cities.length > 1) row.appendChild(removeBtn);
         container.appendChild(row);
     });
