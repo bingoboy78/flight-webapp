@@ -5,8 +5,8 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
+    "fast-flights>=3.1.0",
     "fastapi>=0.136.0",
-    "flights[all]>=0.8.4",
     "python-dotenv>=1.2.2",
     "python-telegram-bot>=22.7",
     "sse-starlette>=3.3.4",

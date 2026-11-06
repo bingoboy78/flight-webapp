@@ -14,11 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 from dotenv import load_dotenv
 from telegram import Bot
 
-from fli.models import (
-    Airport, FlightSearchFilters, FlightSegment, PassengerInfo,
-    MaxStops, LayoverRestrictions
-)
-from fli.search import SearchFlights
+from fast_flights import FlightQuery, Passengers, create_query, get_flights
 
 load_dotenv()
 
@@ -93,10 +89,7 @@ def make_google_flights_url(origin, dest, date, return_date=None):
     return f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{date}"
 
 def get_airport(code):
-    try:
-        return getattr(Airport, code.upper())
-    except AttributeError:
-        return None
+    return code.upper() if code else None
 
 POPULAR_AIRPORTS = [
     {"code": "TLV", "name": "Tel Aviv"},
@@ -153,78 +146,86 @@ def sanitize_date(date_str):
 
 def search_flight(origin_code, dest_code, date_str, direct_only=False):
     date_str = sanitize_date(date_str)
-    search = SearchFlights()
     regional = is_regional(origin_code, dest_code)
+    max_stops = 0 if (direct_only or regional) else 1
 
-    if direct_only or regional:
-        stops = MaxStops.NON_STOP
-        layover = None
-    else:
-        stops = MaxStops.ONE_STOP_OR_FEWER
-        layover = LayoverRestrictions(max_duration=420)
-
-    origin_ap = get_airport(origin_code)
-    dest_ap = get_airport(dest_code)
-    if not origin_ap or not dest_ap:
-        return None
-
-    filters = FlightSearchFilters(
-        passenger_info=PassengerInfo(adults=1),
-        stops=stops,
-        layover_restrictions=layover,
-        flight_segments=[
-            FlightSegment(
-                departure_airport=[[origin_ap, 0]],
-                arrival_airport=[[dest_ap, 0]],
-                travel_date=date_str
-            )
-        ]
+    query = create_query(
+        flights=[FlightQuery(date=date_str, from_airport=str(origin_code).upper(), to_airport=str(dest_code).upper())],
+        trip="one-way",
+        currency="USD",
+        max_stops=max_stops
     )
 
     try:
-        results = search.search(filters)
-        if results:
-            best = sorted(results, key=lambda f: f.price)[0]
-            legs_info = []
-            for leg in best.legs:
-                legs_info.append({
-                    "airline": str(leg.airline),
-                    "flight_number": str(leg.flight_number),
-                    "dep_airport": leg.departure_airport.name,
-                    "arr_airport": leg.arrival_airport.name,
-                    "dep_time": str(getattr(leg, 'departure_datetime', '')),
-                    "arr_time": str(getattr(leg, 'arrival_datetime', ''))
-                })
-            layover_info = None
-            if hasattr(best, 'layovers') and best.layovers:
-                l = best.layovers[0]
+        results = get_flights(query)
+        if not results:
+            return None
+
+        valid_results = [f for f in results if getattr(f, "price", None) and getattr(f, "flights", None)]
+        if not valid_results:
+            return None
+
+        best = min(valid_results, key=lambda f: f.price)
+
+        legs_info = []
+        for idx, leg in enumerate(best.flights):
+            airline_name = ""
+            if best.airlines:
+                airline_name = best.airlines[idx] if idx < len(best.airlines) else best.airlines[0]
+            elif getattr(best, "type", None):
+                airline_name = best.type
+
+            dep_str = ""
+            arr_str = ""
+            if hasattr(leg, "departure") and leg.departure:
+                dep_str = f"{leg.departure.date[0]:04d}-{leg.departure.date[1]:02d}-{leg.departure.date[2]:02d} {leg.departure.time[0]:02d}:{leg.departure.time[1]:02d}"
+            if hasattr(leg, "arrival") and leg.arrival:
+                arr_str = f"{leg.arrival.date[0]:04d}-{leg.arrival.date[1]:02d}-{leg.arrival.date[2]:02d} {leg.arrival.time[0]:02d}:{leg.arrival.time[1]:02d}"
+
+            legs_info.append({
+                "airline": airline_name,
+                "flight_number": leg.plane_type or (getattr(best, "type", "") or ""),
+                "dep_airport": leg.from_airport.name or leg.from_airport.code,
+                "arr_airport": leg.to_airport.name or leg.to_airport.code,
+                "dep_time": dep_str,
+                "arr_time": arr_str
+            })
+
+        layover_info = None
+        dur_min = sum(getattr(f, "duration", 0) for f in best.flights)
+        if len(best.flights) > 1:
+            f0 = best.flights[0]
+            f1 = best.flights[1]
+            try:
+                dt0 = datetime(*f0.arrival.date, *f0.arrival.time)
+                dt1 = datetime(*f1.departure.date, *f1.departure.time)
+                lay_dur = int((dt1 - dt0).total_seconds() // 60)
                 layover_info = {
-                    "airport": l.airport.name,
-                    "duration_min": l.duration
+                    "airport": f0.to_airport.name or f0.to_airport.code,
+                    "duration_min": lay_dur
                 }
-            currency = getattr(best, "currency", "USD") or "USD"
-            raw_price = float(best.price)
-            price_usd = round(to_usd(raw_price, currency), 0)
-            price_ils = to_ils(raw_price, currency)
+                if lay_dur > 0:
+                    dur_min += lay_dur
+            except Exception:
+                pass
 
-            raw_dur = getattr(best, 'duration', 0)
-            if isinstance(raw_dur, timedelta):
-                dur_min = int(raw_dur.total_seconds() // 60)
-            else:
-                dur_min = int(raw_dur or 0)
+        currency = "USD"
+        raw_price = float(best.price)
+        price_usd = round(to_usd(raw_price, currency), 0)
+        price_ils = to_ils(raw_price, currency)
 
-            return {
-                "raw_price": raw_price,
-                "currency": currency,
-                "price_ils": price_ils,
-                "price_usd": price_usd,
-                "duration_min": dur_min,
-                "stops": best.stops,
-                "legs": legs_info,
-                "layover": layover_info,
-                "regional": regional,
-                "booking_url": make_google_flights_url(origin_code, dest_code, date_str)
-            }
+        return {
+            "raw_price": raw_price,
+            "currency": currency,
+            "price_ils": price_ils,
+            "price_usd": price_usd,
+            "duration_min": dur_min,
+            "stops": len(best.flights) - 1,
+            "legs": legs_info,
+            "layover": layover_info,
+            "regional": regional,
+            "booking_url": make_google_flights_url(origin_code, dest_code, date_str)
+        }
     except Exception:
         pass
     return None
